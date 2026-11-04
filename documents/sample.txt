@@ -1,0 +1,10 @@
+Introduction to RAG
+
+Retrieval-Augmented Generation combines information retrieval
+with large language models.
+
+A RAG system first retrieves relevant information and then
+provides that information to an LLM as context.
+
+This allows the model to answer questions using external
+knowledge.
