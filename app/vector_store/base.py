@@ -20,4 +20,7 @@ class VectorStore(ABC):
         limit: int = 5
     ) -> list[Chunk]:
         pass
-    
+
+    @abstractmethod
+    def delete_by_document_id(self, document_id: str) -> None:
+        pass

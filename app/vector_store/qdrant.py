@@ -147,8 +147,31 @@ class QdrantVectorStore(VectorStore):
     
 
     def create_payload_index(self) -> None:
+
         self.client.create_payload_index(
             collection_name=self.collection_name,
             field_name="document_hash",
             field_schema="keyword",
+        )
+
+        self.client.create_payload_index(
+            collection_name=self.collection_name,
+            field_name="document_id",
+            field_schema="keyword",
+        )
+
+
+    def delete_by_document_id(self, document_id: str) -> None:
+
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=document_id),
+                    )
+                ]
+            ),
+            wait=True,
         )

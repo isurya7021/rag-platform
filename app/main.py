@@ -47,6 +47,7 @@ def create_app() -> FastAPI:
     app.state.ingestion_service = ingestion_service
     app.state.document_store = document_store
     app.state.rag_service = rag_service
+    app.state.vector_store = vector_store
 
     app.include_router(router, prefix="/api/v1")
 

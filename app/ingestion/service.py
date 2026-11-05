@@ -72,6 +72,10 @@ class IngestionService:
 
             # A previous attempt failed. Reuse its document ID.
             document_record = existing_document
+
+            # Remove chunks left behind by the previous attempt.
+            self.vector_store.delete_by_document_id(document_record.id)
+
             document_record.status = "processing"
             document_record.total_chunks = 0
             self.document_store.update(document_record)
@@ -199,7 +203,16 @@ class IngestionService:
             }
 
         except Exception:
-            # 10. Record ingestion failure.
+            # Try to remove partially inserted chunks.
+            try:
+                self.vector_store.delete_by_document_id(document_record.id)
+            except Exception as cleanup_error:
+                print(
+                    f"Failed to clean up document chunks: {cleanup_error}",
+                    flush=True,
+                )
+
+            # Mark the document as failed.
             document_record.status = "failed"
 
             try:

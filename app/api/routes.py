@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 from app.ingestion.service import IngestionService
 from app.rag.service import RAGService
 from google.genai import errors
+from app.document_store.base import DocumentStore
+from app.vector_store.base import VectorStore
 
 
 router = APIRouter()
@@ -27,6 +29,12 @@ def get_ingestion_service(request: Request) -> IngestionService:
 
 def get_rag_service(request: Request) -> RAGService:
     return request.app.state.rag_service
+
+def get_document_store(request: Request) -> DocumentStore:
+    return request.app.state.document_store
+
+def get_vector_store(request: Request) -> VectorStore:
+    return request.app.state.vector_store
 
 
 @router.post("/documents")
@@ -103,4 +111,80 @@ def query_documents(
         raise HTTPException(
             status_code=500,
             detail=f"Query failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    
+
+
+@router.get("/documents")
+def list_documents(
+    store: Annotated[DocumentStore, Depends(get_document_store)],
+):
+    try:
+        documents = store.list_all()
+        return documents
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve documents: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@router.get("/documents/{document_id}")
+def get_document(
+    document_id: str,
+    store: Annotated[DocumentStore, Depends(get_document_store)],
+):
+    document = store.get_by_id(document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    return document
+
+
+@router.delete("/documents/{document_id}")
+def delete_document(
+    document_id: str,
+    store: Annotated[DocumentStore, Depends(get_document_store)],
+    vector_store: Annotated[
+        VectorStore,
+        Depends(get_vector_store),
+    ],
+):
+    # 1. Check whether the document exists.
+    document = store.get_by_id(document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    try:
+        # 2. Delete all associated chunks.
+        vector_store.delete_by_document_id(document_id)
+
+        # 3. Delete document metadata.
+        store.delete(document_id)
+
+        return {
+            "document_id": document_id,
+            "filename": document.name,
+            "status": "deleted",
+        }
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document deletion failed: {type(exc).__name__}: {exc}",
         ) from exc
