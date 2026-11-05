@@ -120,9 +120,12 @@ class QdrantVectorStore(VectorStore):
         )
 
     
-    def document_exists(self, document_hash: str) -> bool:
+    def find_document_id_by_hash(
+        self,
+        document_hash: str
+    ) -> str | None:
 
-        result = self.client.scroll(
+        points, _ = self.client.scroll(
             collection_name=self.collection_name,
             scroll_filter=Filter(
                 must=[
@@ -133,13 +136,14 @@ class QdrantVectorStore(VectorStore):
                 ]
             ),
             limit=1,
-            with_payload=False,
+            with_payload=True,
             with_vectors=False,
         )
 
-        points, _ = result
+        if not points:
+            return None
 
-        return len(points) > 0
+        return points[0].payload.get("document_id")
     
 
     def create_payload_index(self) -> None:

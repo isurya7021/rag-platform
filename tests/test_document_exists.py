@@ -1,19 +1,13 @@
+from app.utils.file_hash import calculate_file_hash
 from app.vector_store.qdrant import QdrantVectorStore
 
+vector_store = QdrantVectorStore(
+    collection_name="rag_documents",
+    vector_size=384,
+)
 
-def test_document_exists():
-    vector_store = QdrantVectorStore(
-        collection_name="rag_documents",
-        vector_size=384,
-    )
+file_hash = calculate_file_hash("documents/sample.pdf")
 
-    test_hash = "test_sha256_hash_123"
+document_id = vector_store.find_document_id_by_hash(file_hash)
 
-    # Initially, this hash should not exist.
-    result = vector_store.document_exists(test_hash)
-
-    print("Document exists:", result)
-
-
-if __name__ == "__main__":
-    test_document_exists()
+print("Existing document ID:", document_id)

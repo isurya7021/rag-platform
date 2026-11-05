@@ -20,10 +20,4 @@ class VectorStore(ABC):
         limit: int = 5
     ) -> list[Chunk]:
         pass
-
-    @abstractmethod
-    def document_exists(
-        self,
-        document_hash: str
-    ) -> bool:
-        pass
+    

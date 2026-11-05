@@ -56,16 +56,12 @@ async def ingest_document(
             while contents := await file.read(1024 * 1024):
                 temp_file.write(contents)
 
-        chunks_created = service.ingest(
+        result = service.ingest(
             str(temp_path),
             document_name=file.filename,
         )
 
-        return {
-            "filename": file.filename,
-            "chunks_created": chunks_created,
-            "status": "ingested",
-        }
+        return result
 
     except Exception as exc:
         import traceback
