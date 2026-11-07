@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
 from app.models.document_record import DocumentRecord
+from app.models.document_claim import DocumentClaim
 
 
 class DocumentStore(ABC):
@@ -27,4 +28,11 @@ class DocumentStore(ABC):
 
     @abstractmethod
     def delete(self, document_id: str) -> None:
+        pass
+
+    @abstractmethod
+    def claim_document(
+        self,
+        document: DocumentRecord,
+    ) -> DocumentClaim:
         pass

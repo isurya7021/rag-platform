@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI
 
 from app.api.routes import router
@@ -8,7 +9,7 @@ from app.generation.gemini_generator import GeminiGenerator
 from app.ingestion.service import IngestionService
 from app.rag.service import RAGService
 from app.vector_store.qdrant import QdrantVectorStore
-from app.document_store.qdrant import QdrantDocumentStore
+from app.document_store.postgres import PostgresDocumentStore
 
 
 def create_app() -> FastAPI:
@@ -26,9 +27,7 @@ def create_app() -> FastAPI:
         vector_size=384,
     )
 
-    document_store = QdrantDocumentStore(
-        collection_name="documents",
-    )
+    document_store = PostgresDocumentStore()
 
     generator = GeminiGenerator()
 

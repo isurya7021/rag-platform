@@ -2,26 +2,42 @@
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated
+from uuid import UUID
+import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from pydantic import BaseModel, Field
+from google.genai import errors
 
 from app.ingestion.service import IngestionService
 from app.rag.service import RAGService
-from google.genai import errors
 from app.document_store.base import DocumentStore
 from app.vector_store.base import VectorStore
 
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".docx", ".html"}
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 
 class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=3, ge=1, le=10)
 
+
+# --------------------------------------------------
+# Dependencies
+# --------------------------------------------------
 
 def get_ingestion_service(request: Request) -> IngestionService:
     return request.app.state.ingestion_service
@@ -30,21 +46,28 @@ def get_ingestion_service(request: Request) -> IngestionService:
 def get_rag_service(request: Request) -> RAGService:
     return request.app.state.rag_service
 
+
 def get_document_store(request: Request) -> DocumentStore:
     return request.app.state.document_store
+
 
 def get_vector_store(request: Request) -> VectorStore:
     return request.app.state.vector_store
 
+
+# --------------------------------------------------
+# Document ingestion
+# --------------------------------------------------
 
 @router.post("/documents")
 async def ingest_document(
     file: Annotated[UploadFile, File()],
     service: Annotated[IngestionService, Depends(get_ingestion_service)],
 ):
-    suffix = Path(file.filename or "").suffix.lower()
+    filename = file.filename or ""
+    suffix = Path(filename).suffix.lower()
 
-    if suffix not in SUPPORTED_EXTENSIONS:
+    if not filename or suffix not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail="Unsupported file type. Upload TXT, PDF, DOCX, or HTML.",
@@ -58,34 +81,40 @@ async def ingest_document(
             suffix=suffix,
             prefix="upload_",
         ) as temp_file:
-            
+
             temp_path = Path(temp_file.name)
 
-            while contents := await file.read(1024 * 1024):
+            while contents := await file.read(UPLOAD_CHUNK_SIZE):
                 temp_file.write(contents)
 
         result = service.ingest(
             str(temp_path),
-            document_name=file.filename,
+            document_name=filename,
         )
 
         return result
 
-    except Exception as exc:
-        import traceback
+    except HTTPException:
+        raise
 
-        traceback.print_exc()
+    except Exception as exc:
+        logger.exception("Document ingestion failed")
 
         raise HTTPException(
             status_code=500,
-            detail=f"Document ingestion failed: {type(exc).__name__}: {exc}",
+            detail="Document ingestion failed. Check server logs for details.",
         ) from exc
 
     finally:
         await file.close()
+
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
+
+# --------------------------------------------------
+# Document query
+# --------------------------------------------------
 
 @router.post("/query")
 def query_documents(
@@ -99,79 +128,102 @@ def query_documents(
         )
 
     except errors.APIError as exc:
+        logger.exception("LLM provider error")
+
+        status_code = exc.code if exc.code and 400 <= exc.code <= 599 else 502
+
         raise HTTPException(
-            status_code=exc.code,
-            detail=f"LLM provider error: {exc.message}",
+            status_code=status_code,
+            detail="LLM provider request failed.",
         ) from exc
 
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Document query failed")
 
         raise HTTPException(
             status_code=500,
-            detail=f"Query failed: {type(exc).__name__}: {exc}",
+            detail="Query failed. Check server logs for details.",
         ) from exc
-    
 
+
+# --------------------------------------------------
+# List documents
+# --------------------------------------------------
 
 @router.get("/documents")
 def list_documents(
     store: Annotated[DocumentStore, Depends(get_document_store)],
 ):
     try:
-        documents = store.list_all()
-        return documents
+        return store.list_all()
 
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Failed to retrieve documents")
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve documents: {type(exc).__name__}: {exc}",
+            detail="Failed to retrieve documents.",
         ) from exc
 
 
+# --------------------------------------------------
+# Get document by ID
+# --------------------------------------------------
+
 @router.get("/documents/{document_id}")
 def get_document(
-    document_id: str,
+    document_id: UUID,
     store: Annotated[DocumentStore, Depends(get_document_store)],
 ):
-    document = store.get_by_id(document_id)
+    try:
+        document = store.get_by_id(str(document_id))
 
-    if document is None:
+        if document is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found.",
+            )
+
+        return document
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception("Failed to retrieve document %s", document_id)
+
         raise HTTPException(
-            status_code=404,
-            detail="Document not found",
-        )
+            status_code=500,
+            detail="Failed to retrieve document.",
+        ) from exc
 
-    return document
 
+# --------------------------------------------------
+# Delete document
+# --------------------------------------------------
 
 @router.delete("/documents/{document_id}")
 def delete_document(
-    document_id: str,
+    document_id: UUID,
     store: Annotated[DocumentStore, Depends(get_document_store)],
-    vector_store: Annotated[
-        VectorStore,
-        Depends(get_vector_store),
-    ],
+    vector_store: Annotated[VectorStore, Depends(get_vector_store)],
 ):
-    # 1. Check whether the document exists.
-    document = store.get_by_id(document_id)
-
-    if document is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found",
-        )
+    document_id = str(document_id)
 
     try:
-        # 2. Delete all associated chunks.
+        # 1. Check whether document exists in PostgreSQL.
+        document = store.get_by_id(document_id)
+
+        if document is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found.",
+            )
+
+        # 2. Delete associated vectors from Qdrant.
         vector_store.delete_by_document_id(document_id)
 
-        # 3. Delete document metadata.
+        # 3. Delete document metadata from PostgreSQL.
         store.delete(document_id)
 
         return {
@@ -180,11 +232,13 @@ def delete_document(
             "status": "deleted",
         }
 
+    except HTTPException:
+        raise
+
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Document deletion failed: %s", document_id)
 
         raise HTTPException(
             status_code=500,
-            detail=f"Document deletion failed: {type(exc).__name__}: {exc}",
+            detail="Document deletion failed. You can retry the request.",
         ) from exc

@@ -7,6 +7,7 @@ import pytest
 
 from app.ingestion.service import IngestionService
 from app.models.chunk import Chunk
+from app.models.document_claim import DocumentClaim
 
 
 class FakeDocumentStore:
@@ -36,6 +37,35 @@ class FakeDocumentStore:
 
     def delete(self, document_id):
         self.documents.pop(document_id, None)
+
+    def claim_document(self, document):
+
+        existing = self.get_by_hash(document.content_hash)
+
+        # New document: claim it.
+        if existing is None:
+            self.create(document)
+
+            return DocumentClaim(
+                document=document,
+                claimed=True,
+            )
+
+        # Failed document: allow retry.
+        if existing.status == "failed":
+            existing.status = "processing"
+            self.update(existing)
+
+            return DocumentClaim(
+                document=existing,
+                claimed=True,
+            )
+
+        # Already processing or completed.
+        return DocumentClaim(
+            document=existing,
+            claimed=False,
+        )
 
 
 class FakeVectorStore:

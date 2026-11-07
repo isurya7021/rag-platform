@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import mimetypes
 import time
@@ -45,64 +46,60 @@ class IngestionService:
         # 1. Calculate the document's SHA-256 hash.
         file_hash = calculate_file_hash(path)
 
-        # 2. Check the document registry.
-        existing_document = self.document_store.get_by_hash(file_hash)
+        # 2. Prepare a proposed document record.
+        mime_type, _ = mimetypes.guess_type(name)
 
-        if existing_document:
+        proposed_document = DocumentRecord(
+            id=str(uuid4()),
+            name=name,
+            mime_type=mime_type or "application/octet-stream",
+            content_hash=file_hash,
+            total_chunks=0,
+            status="processing",
+            created_at=datetime.now(timezone.utc),
+        )
 
-            if existing_document.status in ("completed", "empty"):
-                print(f"Document already exists: {name}")
+        # 3. Atomically claim the document.
+        claim = self.document_store.claim_document(
+            proposed_document
+        )
 
+        document_record = claim.document
+
+        # 4. Handle unsuccessful claims.
+        if not claim.claimed:
+
+            if document_record.status in ("completed", "empty"):
                 return {
-                    "document_id": existing_document.id,
-                    "filename": existing_document.name,
-                    "chunks_created": existing_document.total_chunks,
+                    "document_id": document_record.id,
+                    "filename": document_record.name,
+                    "chunks_created": document_record.total_chunks,
                     "status": "already_exists",
                     "duplicate": True,
                 }
 
-            if existing_document.status == "processing":
+            if document_record.status == "processing":
                 return {
-                    "document_id": existing_document.id,
-                    "filename": existing_document.name,
+                    "document_id": document_record.id,
+                    "filename": document_record.name,
                     "chunks_created": 0,
                     "status": "already_processing",
                     "duplicate": True,
                 }
 
-            # A previous attempt failed. Reuse its document ID.
-            document_record = existing_document
-
-            # Remove chunks left behind by the previous attempt.
-            self.vector_store.delete_by_document_id(document_record.id)
-
-            document_record.status = "processing"
-            document_record.total_chunks = 0
-            self.document_store.update(document_record)
-
-        else:
-
-            # 3. Create a new document record.
-            document_id = str(uuid4())
-
-            mime_type, _ = mimetypes.guess_type(name)
-
-            document_record = DocumentRecord(
-                id=document_id,
-                name=name,
-                mime_type=mime_type or "application/octet-stream",
-                content_hash=file_hash,
-                total_chunks=0,
-                status="processing",
-                created_at=datetime.now(timezone.utc),
+            raise RuntimeError(
+                f"Document could not be claimed. "
+                f"Current status: {document_record.status}"
             )
-
-            self.document_store.create(document_record)
 
         document_id = document_record.id
 
         try:
-            # 4. Parse the document.
+            # 5. Remove leftover chunks from any previous attempt.
+            # This is harmless for a newly created document.
+            self.vector_store.delete_by_document_id(document_id)
+
+            # 6. Parse the document.
             start = time.perf_counter()
 
             parser = ParserFactory.get_parser(str(path))
@@ -119,7 +116,7 @@ class IngestionService:
                 flush=True,
             )
 
-            # 5. Generate chunks.
+            # 7. Generate chunks.
             start = time.perf_counter()
 
             chunks = self.chunker.chunk(document)
@@ -147,14 +144,14 @@ class IngestionService:
                     "duplicate": False,
                 }
 
-            # 6. Attach document-level metadata to every chunk.
+            # 8. Attach document-level metadata to every chunk.
             for index, chunk in enumerate(chunks):
                 chunk.metadata["document_id"] = document_id
                 chunk.metadata["document_name"] = name
                 chunk.metadata["document_hash"] = file_hash
                 chunk.metadata["chunk_index"] = index
 
-            # 7. Generate embeddings.
+            # 9. Generate embeddings.
             texts = [chunk.content for chunk in chunks]
 
             start = time.perf_counter()
@@ -170,7 +167,7 @@ class IngestionService:
                     "Number of embeddings does not match number of chunks"
                 )
 
-            # 8. Store chunks and vectors.
+            # 10. Store chunks and vectors.
             start = time.perf_counter()
 
             self.vector_store.upsert(
@@ -183,7 +180,7 @@ class IngestionService:
                 flush=True,
             )
 
-            # 9. Mark document ingestion as completed.
+            # 11. Mark document ingestion as completed.
             document_record.total_chunks = len(chunks)
             document_record.status = "completed"
 
@@ -203,16 +200,17 @@ class IngestionService:
             }
 
         except Exception:
-            # Try to remove partially inserted chunks.
+
+            # 12. Try to remove partially inserted chunks.
             try:
-                self.vector_store.delete_by_document_id(document_record.id)
+                self.vector_store.delete_by_document_id(document_id)
             except Exception as cleanup_error:
                 print(
                     f"Failed to clean up document chunks: {cleanup_error}",
                     flush=True,
                 )
 
-            # Mark the document as failed.
+            # 13. Mark the document as failed.
             document_record.status = "failed"
 
             try:
