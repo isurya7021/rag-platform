@@ -4,7 +4,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import update as sql_update
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from uuid import UUID, uuid4
 
 
 from app.database.connection import SessionLocal
@@ -13,6 +14,7 @@ from app.document_store.base import DocumentStore
 from app.models.document_record import DocumentRecord
 from app.models.document_claim import DocumentClaim
 
+LEASE_DURATION = timedelta(minutes=5)
 
 class PostgresDocumentStore(DocumentStore):
 
@@ -110,11 +112,15 @@ class PostgresDocumentStore(DocumentStore):
                 session.commit()
 
     
-    
     def claim_document(
         self,
         document: DocumentRecord,
     ) -> DocumentClaim:
+
+        claim_token = uuid4()
+
+        now = datetime.now(timezone.utc)
+        lease_expires_at = now + LEASE_DURATION
 
         with self.session_factory() as session:
 
@@ -128,6 +134,8 @@ class PostgresDocumentStore(DocumentStore):
                     content_hash=document.content_hash,
                     total_chunks=0,
                     status="processing",
+                    claim_token=claim_token,
+                    lease_expires_at=lease_expires_at,
                     created_at=document.created_at,
                 )
                 .on_conflict_do_nothing(
@@ -136,7 +144,9 @@ class PostgresDocumentStore(DocumentStore):
                 .returning(DocumentModel.id)
             )
 
-            inserted_id = session.execute(statement).scalar_one_or_none()
+            inserted_id = session.execute(
+                statement
+            ).scalar_one_or_none()
 
             # 2. New document successfully claimed.
             if inserted_id is not None:
@@ -145,11 +155,11 @@ class PostgresDocumentStore(DocumentStore):
                 return DocumentClaim(
                     document=document,
                     claimed=True,
+                    claim_token=claim_token,
                 )
 
-            # 3. Document already exists. Try to claim it
-            #    only if its previous status is failed.
-            retry_statement = (
+            # 3. Retry a document whose previous attempt failed.
+            retry_failed_statement = (
                 sql_update(DocumentModel)
                 .where(
                     DocumentModel.content_hash == document.content_hash,
@@ -158,26 +168,60 @@ class PostgresDocumentStore(DocumentStore):
                 .values(
                     status="processing",
                     total_chunks=0,
-                    updated_at=datetime.now(timezone.utc),
+                    claim_token=claim_token,
+                    lease_expires_at=lease_expires_at,
+                    updated_at=now,
                 )
                 .returning(DocumentModel)
             )
 
             existing_model = session.scalars(
-                retry_statement
+                retry_failed_statement
             ).one_or_none()
 
             if existing_model is not None:
                 record = self._to_record(existing_model)
-
                 session.commit()
 
                 return DocumentClaim(
                     document=record,
                     claimed=True,
+                    claim_token=claim_token,
                 )
 
-            # 4. Another request owns it, or it is already completed.
+            # 4. Take over a document whose processing lease expired.
+            expired_lease_statement = (
+                sql_update(DocumentModel)
+                .where(
+                    DocumentModel.content_hash == document.content_hash,
+                    DocumentModel.status == "processing",
+                    DocumentModel.lease_expires_at <= now,
+                )
+                .values(
+                    status="processing",
+                    total_chunks=0,
+                    claim_token=claim_token,
+                    lease_expires_at=lease_expires_at,
+                    updated_at=now,
+                )
+                .returning(DocumentModel)
+            )
+
+            existing_model = session.scalars(
+                expired_lease_statement
+            ).one_or_none()
+
+            if existing_model is not None:
+                record = self._to_record(existing_model)
+                session.commit()
+
+                return DocumentClaim(
+                    document=record,
+                    claimed=True,
+                    claim_token=claim_token,
+                )
+
+            # 5. Another worker owns it, or it is already completed.
             existing_model = session.scalar(
                 select(DocumentModel).where(
                     DocumentModel.content_hash == document.content_hash
@@ -190,11 +234,76 @@ class PostgresDocumentStore(DocumentStore):
                 )
 
             record = self._to_record(existing_model)
-
             session.commit()
 
             return DocumentClaim(
                 document=record,
                 claimed=False,
+                claim_token=None,
             )
 
+
+    def update_claimed(
+        self,
+        document: DocumentRecord,
+        claim_token: UUID,
+    ) -> None:
+
+        with self.session_factory() as session:
+            statement = (
+                sql_update(DocumentModel)
+                .where(
+                    DocumentModel.id == UUID(document.id),
+                    DocumentModel.claim_token == claim_token,
+                )
+                .values(
+                    name=document.name,
+                    mime_type=document.mime_type,
+                    total_chunks=document.total_chunks,
+                    status=document.status,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+
+            result = session.execute(statement)
+
+            if result.rowcount == 0:
+                session.rollback()
+                raise RuntimeError(
+                    "Document claim lost. Worker is no longer authorized to update it."
+                )
+
+            session.commit()
+
+    def renew_lease(
+        self,
+        document_id: str,
+        claim_token: UUID,
+    ) -> None:
+
+        now = datetime.now(timezone.utc)
+
+        with self.session_factory() as session:
+            statement = (
+                sql_update(DocumentModel)
+                .where(
+                    DocumentModel.id == UUID(document_id),
+                    DocumentModel.claim_token == claim_token,
+                    DocumentModel.status == "processing",
+                    DocumentModel.lease_expires_at > now,
+                )
+                .values(
+                    lease_expires_at=now + LEASE_DURATION,
+                    updated_at=now,
+                )
+            )
+
+            result = session.execute(statement)
+
+            if result.rowcount == 0:
+                session.rollback()
+                raise RuntimeError(
+                    "Cannot renew lease. Document claim is lost or expired."
+                )
+
+            session.commit()

@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from app.models.document_record import DocumentRecord
 
@@ -8,3 +9,4 @@ from app.models.document_record import DocumentRecord
 class DocumentClaim:
     document: DocumentRecord
     claimed: bool
+    claim_token: UUID | None = None

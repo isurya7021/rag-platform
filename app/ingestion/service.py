@@ -12,6 +12,9 @@ from app.vector_store.base import VectorStore
 from app.document_store.base import DocumentStore
 from app.models.document_record import DocumentRecord
 from app.utils.file_hash import calculate_file_hash
+from threading import Event, Thread
+from uuid import UUID
+LEASE_RENEWAL_INTERVAL = 60  # seconds
 
 
 class IngestionService:
@@ -92,9 +95,26 @@ class IngestionService:
                 f"Current status: {document_record.status}"
             )
 
+        claim_token = claim.claim_token
+
+        if claim_token is None:
+            raise RuntimeError(
+                "Document was claimed, but no claim token was returned."
+            )
+
         document_id = document_record.id
 
+        stop_heartbeat, heartbeat_thread, ensure_lease = (
+            self._start_lease_heartbeat(
+                document_id,
+                claim_token,
+            )
+        )
+
         try:
+
+            ensure_lease()
+
             # 5. Remove leftover chunks from any previous attempt.
             # This is harmless for a newly created document.
             self.vector_store.delete_by_document_id(document_id)
@@ -104,12 +124,16 @@ class IngestionService:
 
             parser = ParserFactory.get_parser(str(path))
             document = parser.parse(str(path))
+            ensure_lease()
 
             document.id = document_id
             document.name = name
 
             document_record.mime_type = document.mime_type
-            self.document_store.update(document_record)
+            self.document_store.update_claimed(
+                document_record,
+                claim_token,
+            )
 
             print(
                 f"[TIMING] Parsing: {time.perf_counter() - start:.2f}s",
@@ -120,6 +144,8 @@ class IngestionService:
             start = time.perf_counter()
 
             chunks = self.chunker.chunk(document)
+            ensure_lease()
+            
 
             print(
                 f"[TIMING] Chunking: {time.perf_counter() - start:.2f}s",
@@ -134,7 +160,10 @@ class IngestionService:
             if not chunks:
                 document_record.status = "empty"
                 document_record.total_chunks = 0
-                self.document_store.update(document_record)
+                self.document_store.update_claimed(
+                    document_record,
+                    claim_token,
+                )
 
                 return {
                     "document_id": document_id,
@@ -156,6 +185,7 @@ class IngestionService:
 
             start = time.perf_counter()
             vectors = self.embedding_model.embed_batch(texts)
+            ensure_lease()
 
             print(
                 f"[TIMING] Embedding: {time.perf_counter() - start:.2f}s",
@@ -170,6 +200,7 @@ class IngestionService:
             # 10. Store chunks and vectors.
             start = time.perf_counter()
 
+            ensure_lease()
             self.vector_store.upsert(
                 chunks=chunks,
                 vectors=vectors,
@@ -180,11 +211,16 @@ class IngestionService:
                 flush=True,
             )
 
+            ensure_lease()
+
             # 11. Mark document ingestion as completed.
             document_record.total_chunks = len(chunks)
             document_record.status = "completed"
 
-            self.document_store.update(document_record)
+            self.document_store.update_claimed(
+                document_record,
+                claim_token,
+            )
 
             print(f"Document: {name}")
             print(f"Document ID: {document_id}")
@@ -201,20 +237,45 @@ class IngestionService:
 
         except Exception:
 
-            # 12. Try to remove partially inserted chunks.
+            # 12. First verify ownership and prevent another retry
+            # from starting while cleanup is in progress.
+            try:
+                document_record.status = "failed_cleanup"
+
+                self.document_store.update_claimed(
+                    document_record,
+                    claim_token,
+                )
+
+            except Exception as ownership_error:
+                print(
+                    f"Could not transition document to failed_cleanup. "
+                    f"Skipping vector cleanup because claim ownership "
+                    f"could not be verified: {ownership_error}",
+                    flush=True,
+                )
+
+                raise
+
+            # 13. Clean up partially inserted vectors.
             try:
                 self.vector_store.delete_by_document_id(document_id)
+
             except Exception as cleanup_error:
                 print(
                     f"Failed to clean up document chunks: {cleanup_error}",
                     flush=True,
                 )
 
-            # 13. Mark the document as failed.
+            # 14. Mark the document as failed and allow a future retry.
             document_record.status = "failed"
 
             try:
-                self.document_store.update(document_record)
+                self.document_store.update_claimed(
+                    document_record,
+                    claim_token,
+                )
+
             except Exception as update_error:
                 print(
                     f"Could not update document failure status: {update_error}",
@@ -222,3 +283,45 @@ class IngestionService:
                 )
 
             raise
+        
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=5)
+
+    def _start_lease_heartbeat(
+        self,
+        document_id: str,
+        claim_token: UUID,
+    ):
+        stop_event = Event()
+        heartbeat_errors = []
+
+        def heartbeat():
+            while not stop_event.wait(LEASE_RENEWAL_INTERVAL):
+                try:
+                    self.document_store.renew_lease(
+                        document_id,
+                        claim_token,
+                    )
+
+                except Exception as exc:
+                    heartbeat_errors.append(exc)
+                    stop_event.set()
+                    return
+
+        thread = Thread(
+            target=heartbeat,
+            daemon=True,
+            name=f"lease-heartbeat-{document_id}",
+        )
+
+        thread.start()
+
+        def ensure_lease():
+            if heartbeat_errors:
+                raise RuntimeError(
+                    "Document lease renewal failed. "
+                    "Worker may have lost ownership."
+                ) from heartbeat_errors[0]
+
+        return stop_event, thread, ensure_lease

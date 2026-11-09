@@ -8,6 +8,7 @@ import pytest
 from app.ingestion.service import IngestionService
 from app.models.chunk import Chunk
 from app.models.document_claim import DocumentClaim
+from uuid import uuid4
 
 
 class FakeDocumentStore:
@@ -38,20 +39,21 @@ class FakeDocumentStore:
     def delete(self, document_id):
         self.documents.pop(document_id, None)
 
-    def claim_document(self, document):
+    def update_claimed(self, document, claim_token):
+        self.update(document)
 
+    def claim_document(self, document):
         existing = self.get_by_hash(document.content_hash)
 
-        # New document: claim it.
         if existing is None:
             self.create(document)
 
             return DocumentClaim(
                 document=document,
                 claimed=True,
+                claim_token=uuid4(),
             )
 
-        # Failed document: allow retry.
         if existing.status == "failed":
             existing.status = "processing"
             self.update(existing)
@@ -59,13 +61,18 @@ class FakeDocumentStore:
             return DocumentClaim(
                 document=existing,
                 claimed=True,
+                claim_token=uuid4(),
             )
 
-        # Already processing or completed.
         return DocumentClaim(
             document=existing,
             claimed=False,
+            claim_token=None,
         )
+    
+    def renew_lease(self, document_id, claim_token):
+        # Heartbeat is not triggered in the short-running unit tests.
+        pass
 
 
 class FakeVectorStore:
@@ -107,6 +114,10 @@ class FakeChunker:
             Chunk(id="chunk-3", content="Third chunk"),
         ]
 
+class FakeGenerator:
+
+    def generate(self, query, context):
+        return "This is a mocked response."
 
 def test_failed_ingestion_cleanup_and_retry():
     document_store = FakeDocumentStore()
