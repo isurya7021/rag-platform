@@ -7,6 +7,8 @@ from app.embeddings.sentence_transformer import (
 from app.generation.gemini_generator import GeminiGenerator
 from app.rag.service import RAGService
 from app.vector_store.qdrant import QdrantVectorStore
+from app.document_store.postgres import PostgresDocumentStore
+
 
 def main():
     embedding_model = SentenceTransformerEmbeddingModel()
@@ -16,11 +18,15 @@ def main():
         vector_size=384,
     )
 
+    document_store = PostgresDocumentStore()
+
+
     generator = GeminiGenerator()
 
     rag = RAGService(
         embedding_model=embedding_model,
         vector_store=vector_store,
+        document_store=document_store,
         generator=generator,
     )
 

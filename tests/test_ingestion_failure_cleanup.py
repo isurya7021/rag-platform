@@ -52,6 +52,7 @@ class FakeDocumentStore:
                 document=document,
                 claimed=True,
                 claim_token=uuid4(),
+                generation_id=uuid4(),
             )
 
         if existing.status == "failed":
@@ -62,12 +63,14 @@ class FakeDocumentStore:
                 document=existing,
                 claimed=True,
                 claim_token=uuid4(),
+                generation_id=uuid4(),
             )
 
         return DocumentClaim(
             document=existing,
             claimed=False,
             claim_token=None,
+            generation_id=None,
         )
     
     def renew_lease(self, document_id, claim_token):

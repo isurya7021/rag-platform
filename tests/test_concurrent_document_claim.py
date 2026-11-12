@@ -43,6 +43,12 @@ def test_concurrent_document_claim():
         print(f"Successful claims: {len(successful_claims)}")
         print(f"Unsuccessful claims: {len(unsuccessful_claims)}")
 
+        assert successful_claims[0].generation_id is not None
+        assert all(
+            result.generation_id is None
+            for result in unsuccessful_claims
+        )
+
         assert len(successful_claims) == 1
         assert len(unsuccessful_claims) == 9
 

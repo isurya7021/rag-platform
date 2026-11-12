@@ -53,3 +53,22 @@ class DocumentStore(ABC):
         claim_token: UUID,
     ) -> None:
         pass
+
+
+    @abstractmethod
+    def publish_generation(
+        self,
+        document_id: str,
+        claim_token: UUID,
+        generation_id: UUID,
+        total_chunks: int,
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def get_published_generations(self) -> list[tuple[str, str]]:
+        """
+        Return (document_id, published_generation_id) pairs
+        for documents that have a published generation.
+        """
+        pass

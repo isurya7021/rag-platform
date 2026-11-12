@@ -96,11 +96,14 @@ class IngestionService:
             )
 
         claim_token = claim.claim_token
+        generation_id = claim.generation_id
 
-        if claim_token is None:
+        if claim_token is None or generation_id is None:
             raise RuntimeError(
-                "Document was claimed, but no claim token was returned."
+                "Document was claimed without a claim token or generation ID."
             )
+
+        generation_id_str = str(generation_id)
 
         document_id = document_record.id
 
@@ -112,12 +115,7 @@ class IngestionService:
         )
 
         try:
-
             ensure_lease()
-
-            # 5. Remove leftover chunks from any previous attempt.
-            # This is harmless for a newly created document.
-            self.vector_store.delete_by_document_id(document_id)
 
             # 6. Parse the document.
             start = time.perf_counter()
@@ -179,6 +177,7 @@ class IngestionService:
                 chunk.metadata["document_name"] = name
                 chunk.metadata["document_hash"] = file_hash
                 chunk.metadata["chunk_index"] = index
+                chunk.metadata["generation_id"] = generation_id_str
 
             # 9. Generate embeddings.
             texts = [chunk.content for chunk in chunks]

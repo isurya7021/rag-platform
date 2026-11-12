@@ -32,6 +32,8 @@ class PostgresDocumentStore(DocumentStore):
             total_chunks=model.total_chunks,
             status=model.status,
             created_at=model.created_at,
+            active_generation_id=model.active_generation_id,
+            published_generation_id=model.published_generation_id,
         )
 
     @staticmethod
@@ -43,6 +45,8 @@ class PostgresDocumentStore(DocumentStore):
             content_hash=document.content_hash,
             total_chunks=document.total_chunks,
             status=document.status,
+            active_generation_id=document.active_generation_id,
+            published_generation_id=document.published_generation_id,
             created_at=document.created_at,
         )
 
@@ -101,6 +105,8 @@ class PostgresDocumentStore(DocumentStore):
             model.content_hash = document.content_hash
             model.total_chunks = document.total_chunks
             model.status = document.status
+            model.active_generation_id = document.active_generation_id
+            model.published_generation_id = document.published_generation_id
             session.commit()
 
     def delete(self, document_id: str) -> None:
@@ -118,6 +124,7 @@ class PostgresDocumentStore(DocumentStore):
     ) -> DocumentClaim:
 
         claim_token = uuid4()
+        generation_id = uuid4()
 
         now = datetime.now(timezone.utc)
         lease_expires_at = now + LEASE_DURATION
@@ -136,26 +143,31 @@ class PostgresDocumentStore(DocumentStore):
                     status="processing",
                     claim_token=claim_token,
                     lease_expires_at=lease_expires_at,
+                    active_generation_id=generation_id,
+                    published_generation_id=None,
                     created_at=document.created_at,
                 )
                 .on_conflict_do_nothing(
                     index_elements=["content_hash"]
                 )
-                .returning(DocumentModel.id)
+                .returning(DocumentModel)
             )
 
-            inserted_id = session.execute(
+            existing_model = session.scalars(
                 statement
-            ).scalar_one_or_none()
+            ).one_or_none()
 
             # 2. New document successfully claimed.
-            if inserted_id is not None:
+            if existing_model is not None:
+
+                record = self._to_record(existing_model)
                 session.commit()
 
                 return DocumentClaim(
-                    document=document,
+                    document=record,
                     claimed=True,
                     claim_token=claim_token,
+                    generation_id=generation_id,
                 )
 
             # 3. Retry a document whose previous attempt failed.
@@ -167,9 +179,9 @@ class PostgresDocumentStore(DocumentStore):
                 )
                 .values(
                     status="processing",
-                    total_chunks=0,
                     claim_token=claim_token,
                     lease_expires_at=lease_expires_at,
+                    active_generation_id=generation_id,
                     updated_at=now,
                 )
                 .returning(DocumentModel)
@@ -180,6 +192,7 @@ class PostgresDocumentStore(DocumentStore):
             ).one_or_none()
 
             if existing_model is not None:
+
                 record = self._to_record(existing_model)
                 session.commit()
 
@@ -187,6 +200,7 @@ class PostgresDocumentStore(DocumentStore):
                     document=record,
                     claimed=True,
                     claim_token=claim_token,
+                    generation_id=generation_id,
                 )
 
             # 4. Take over a document whose processing lease expired.
@@ -199,9 +213,9 @@ class PostgresDocumentStore(DocumentStore):
                 )
                 .values(
                     status="processing",
-                    total_chunks=0,
                     claim_token=claim_token,
                     lease_expires_at=lease_expires_at,
+                    active_generation_id=generation_id,
                     updated_at=now,
                 )
                 .returning(DocumentModel)
@@ -212,6 +226,7 @@ class PostgresDocumentStore(DocumentStore):
             ).one_or_none()
 
             if existing_model is not None:
+
                 record = self._to_record(existing_model)
                 session.commit()
 
@@ -219,6 +234,7 @@ class PostgresDocumentStore(DocumentStore):
                     document=record,
                     claimed=True,
                     claim_token=claim_token,
+                    generation_id=generation_id,
                 )
 
             # 5. Another worker owns it, or it is already completed.
@@ -240,6 +256,7 @@ class PostgresDocumentStore(DocumentStore):
                 document=record,
                 claimed=False,
                 claim_token=None,
+                generation_id=None,
             )
 
 
@@ -307,3 +324,61 @@ class PostgresDocumentStore(DocumentStore):
                 )
 
             session.commit()
+
+    
+    def publish_generation(
+        self,
+        document_id: str,
+        claim_token: UUID,
+        generation_id: UUID,
+        total_chunks: int,
+    ) -> None:
+
+        now = datetime.now(timezone.utc)
+
+        with self.session_factory() as session:
+
+            statement = (
+                sql_update(DocumentModel)
+                .where(
+                    DocumentModel.id == UUID(document_id),
+                    DocumentModel.claim_token == claim_token,
+                    DocumentModel.active_generation_id == generation_id,
+                    DocumentModel.status == "processing",
+                    DocumentModel.lease_expires_at > now,
+                )
+                .values(
+                    published_generation_id=generation_id,
+                    status="completed",
+                    total_chunks=total_chunks,
+                    updated_at=now,
+                )
+            )
+
+            result = session.execute(statement)
+
+            if result.rowcount == 0:
+                session.rollback()
+                raise RuntimeError(
+                    "Cannot publish generation. "
+                    "Worker lost ownership or generation is no longer active."
+                )
+
+            session.commit()
+
+    
+    def get_published_generations(self) -> list[tuple[str, str]]:
+        with self.session_factory() as session:
+            statement = select(
+                DocumentModel.id,
+                DocumentModel.published_generation_id,
+            ).where(
+                DocumentModel.published_generation_id.is_not(None)
+            )
+
+            rows = session.execute(statement).all()
+
+            return [
+                (str(document_id), str(generation_id))
+                for document_id, generation_id in rows
+            ]

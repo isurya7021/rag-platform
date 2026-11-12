@@ -84,3 +84,14 @@ class DocumentModel(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+    active_generation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+
+    published_generation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+

@@ -40,6 +40,7 @@ def create_app() -> FastAPI:
     rag_service = RAGService(
         embedding_model=embedding_model,
         vector_store=vector_store,
+        document_store=document_store,
         generator=generator,
     )
 

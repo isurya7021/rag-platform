@@ -10,6 +10,7 @@ from qdrant_client.models import (
 
 from app.models.chunk import Chunk
 from app.vector_store.base import VectorStore
+from uuid import uuid5, NAMESPACE_URL
 
 
 class QdrantVectorStore(VectorStore):
@@ -57,38 +58,85 @@ class QdrantVectorStore(VectorStore):
     def upsert(
         self,
         chunks: list[Chunk],
-        vectors: list[list[float]]
+        vectors: list[list[float]],
+        generation_id: str,
     ) -> None:
+
+        if len(chunks) != len(vectors):
+            raise ValueError(
+                "Number of chunks and vectors must match"
+            )
 
         points = []
 
         for chunk, vector in zip(chunks, vectors):
 
+            document_id = chunk.metadata["document_id"]
+
+            point_id = self._generate_point_id(
+                document_id=document_id,
+                generation_id=generation_id,
+                chunk_id=chunk.id,
+            )
+
+            payload = {
+                "content": chunk.content,
+                **chunk.metadata,
+                "generation_id": generation_id,
+            }
+
             points.append(
                 PointStruct(
-                    id=chunk.id,
+                    id=point_id,
                     vector=vector,
-                    payload={
-                        "content": chunk.content,
-                        **chunk.metadata
-                    }
+                    payload=payload,
                 )
             )
 
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=points
-        )
+        if points:
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
 
     def search(
         self,
         query_vector: list[float],
-        limit: int = 5
+        limit: int = 5,
+        published_generations: list[tuple[str, str]] | None = None,
     ) -> list[Chunk]:
+
+        # No published generations means no searchable documents.
+        if not published_generations:
+            return []
+
+        # Build one condition for each document-generation pair.
+        generation_filters = [
+            Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=document_id),
+                    ),
+                    FieldCondition(
+                        key="generation_id",
+                        match=MatchValue(value=generation_id),
+                    ),
+                ]
+            )
+            for document_id, generation_id in published_generations
+        ]
+
+        # Search only within the published generations.
+        search_filter = Filter(
+            should=generation_filters
+        )
 
         results = self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
+            query_filter=search_filter,
             limit=limit,
         ).points
 
@@ -101,7 +149,7 @@ class QdrantVectorStore(VectorStore):
                     for key, value in result.payload.items()
                     if key != "content"
                 },
-                score=result.score
+                score=result.score,
             )
             for result in results
         ]
@@ -160,6 +208,12 @@ class QdrantVectorStore(VectorStore):
             field_schema="keyword",
         )
 
+        self.client.create_payload_index(
+            collection_name=self.collection_name,
+            field_name="generation_id",
+            field_schema="keyword",
+        )
+
 
     def delete_by_document_id(self, document_id: str) -> None:
 
@@ -175,3 +229,38 @@ class QdrantVectorStore(VectorStore):
             ),
             wait=True,
         )
+
+    @staticmethod
+    def _generate_point_id(
+        document_id: str,
+        generation_id: str,
+        chunk_id: str,
+    ) -> str:
+        unique_key = f"{document_id}:{generation_id}:{chunk_id}"
+
+        return str(uuid5(NAMESPACE_URL, unique_key))
+    
+    def delete_by_generation(
+        self,
+        document_id: str,
+        generation_id: str,
+    ) -> None:
+
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=document_id),
+                    ),
+                    FieldCondition(
+                        key="generation_id",
+                        match=MatchValue(value=generation_id),
+                    ),
+                ]
+            ),
+            wait=True,
+        )
+
+    

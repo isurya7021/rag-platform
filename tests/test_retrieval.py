@@ -19,6 +19,7 @@ query_vector = embedding_model.embed(query)
 results = vector_store.search(
     query_vector=query_vector,
     limit=3,
+    published_generations=None,
 )
 
 for result in results:

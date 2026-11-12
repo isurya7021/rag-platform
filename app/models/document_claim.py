@@ -10,3 +10,5 @@ class DocumentClaim:
     document: DocumentRecord
     claimed: bool
     claim_token: UUID | None = None
+    generation_id: UUID | None = None
+

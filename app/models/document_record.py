@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from uuid import UUID
 
 
 @dataclass
@@ -11,3 +12,5 @@ class DocumentRecord:
     total_chunks: int
     status: str
     created_at: datetime
+    active_generation_id: UUID | None = None
+    published_generation_id: UUID | None = None
